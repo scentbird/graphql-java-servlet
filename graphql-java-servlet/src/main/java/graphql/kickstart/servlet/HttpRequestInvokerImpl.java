@@ -17,20 +17,26 @@ import graphql.kickstart.servlet.input.BatchInputPreProcessResult;
 import graphql.kickstart.servlet.input.BatchInputPreProcessor;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.Timer;
+import java.util.TimerTask;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import jakarta.servlet.AsyncContext;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.dataloader.DataLoaderRegistry;
 
 @Slf4j
 @RequiredArgsConstructor
 public class HttpRequestInvokerImpl implements HttpRequestInvoker {
+
+  private final Timer timer = new Timer("dataloader-timer");
 
   private final GraphQLConfiguration configuration;
   private final GraphQLInvoker graphQLInvoker;
@@ -104,10 +110,33 @@ public class HttpRequestInvokerImpl implements HttpRequestInvoker {
       HttpServletRequest request,
       HttpServletResponse response,
       ListenerHandler listenerHandler) {
+    TimerTask timerTask = null;
     try {
       FutureExecutionResult futureResult = invoke(invocationInput, request, response);
-      handleInternal(futureResult, request, response, listenerHandler)
-          .get(configuration.getAsyncTimeout(), TimeUnit.MILLISECONDS);
+      CompletableFuture<Void> handeResult = handleInternal(futureResult, request, response, listenerHandler);
+      try {
+        handeResult.get(50, TimeUnit.MILLISECONDS);
+      } catch (TimeoutException timeoutException) {
+        if (futureResult.getInvocationInput() instanceof GraphQLSingleInvocationInput) {
+          GraphQLSingleInvocationInput singleInvocationInput =
+              (GraphQLSingleInvocationInput) futureResult.getInvocationInput();
+
+          DataLoaderRegistry dataLoaderRegistry =
+              singleInvocationInput.getExecutionInput().getDataLoaderRegistry();
+
+          dataLoaderRegistry.dispatchAll();
+
+          timerTask = new TimerTask() {
+            @Override
+            public void run() {
+              log.info("Timeout: dispatched {} entries", dataLoaderRegistry.dispatchAllWithCount());
+            }
+          };
+          timer.schedule(timerTask,0,50);
+        }
+
+        handeResult.get(configuration.getAsyncTimeout() - 50, TimeUnit.MILLISECONDS);
+      }
     } catch (GraphQLException e) {
       response.setStatus(STATUS_BAD_REQUEST);
       log.info("Bad request: cannot handle http request", e);
@@ -116,8 +145,9 @@ public class HttpRequestInvokerImpl implements HttpRequestInvoker {
       response.setStatus(STATUS_INTERNAL_SERVER_ERROR);
       log.error("Cannot handle http request", e);
       listenerHandler.onError(e);
-      if (e instanceof InterruptedException) {
-        Thread.currentThread().interrupt();
+    } finally {
+      if (timerTask != null) {
+        timerTask.cancel();
       }
     }
   }

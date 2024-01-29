@@ -189,7 +189,3 @@ nexusPublishing {
         }
     }
 }
-
-wrapper {
-    distributionType = Wrapper.DistributionType.ALL
-}
